@@ -19,6 +19,27 @@ table3
 # if no key is specified, the default is a lexical sort
 table4 = etl.sort(table1)
 table4
+# multiple fields can be sorted in different directions, with null placement
+# independent of direction
+bills = [['customer', 'amount'],
+         ['B', 20],
+         ['A', None],
+         ['A', 5],
+         ['B', None],
+         ['A', 7]]
+table5 = etl.sort(
+    bills,
+    key=[('customer', 'asc'), ('amount', 'desc', 'last')]
+)
+table5
+# equivalent per-field option form
+table6 = etl.sort(
+    bills,
+    key=['customer', 'amount'],
+    reverse=[False, True],
+    nulls_first=[True, False]
+)
+table6
 
 
 # mergesort()
@@ -52,4 +73,3 @@ etl.issorted(table1, key='foo')
 etl.issorted(table1, key='bar')
 etl.issorted(table1, key='foo', strict=True)
 etl.issorted(table1, key='foo', reverse=True)
-

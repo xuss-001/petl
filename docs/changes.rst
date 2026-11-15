@@ -4,6 +4,12 @@ Changes
 Version 1.7.33
 --------------
 
+* Extend ``sort()`` with per-field ascending/descending and null-placement
+  rules, including tuple/dictionary sort descriptors and per-field
+  ``reverse`` or ``nulls_first`` options. Missing cells in short rows sort as
+  nulls, null placement is independent of direction, and equal keys remain
+  stable across in-memory and temporary-file sorts.
+
 * Accept a tuple or list of fields passed as a single argument to
   ``valuecounter()`` and ``valuecounts()``, counting the same compound key
   as unpacking it with ``*``, like ``values()`` already does. It used to

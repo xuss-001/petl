@@ -3,6 +3,7 @@ from __future__ import absolute_import, print_function, division
 
 import os
 import heapq
+import errno
 from tempfile import NamedTemporaryFile
 import itertools
 import logging
@@ -12,7 +13,7 @@ from petl.compat import pickle, next, text_type
 
 
 import petl.config as config
-from petl.comparison import comparable_itemgetter
+from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, asindices
 
 
@@ -22,8 +23,194 @@ info = logger.info
 debug = logger.debug
 
 
+def _parse_sort_direction(value, name='sort direction'):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, text_type):
+        value = value.strip().lower().replace('-', '_')
+        if value in ('asc', 'ascending', 'ascend', 'a'):
+            return False
+        if value in ('desc', 'descending', 'descend', 'd'):
+            return True
+    elif isinstance(value, int):
+        return value != 0
+    raise ValueError('invalid %s: %r' % (name, value))
+
+
+def _parse_null_placement(value, name='null placement'):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, text_type):
+        value = value.strip().lower().replace('-', '_').replace(' ', '_')
+        if value in ('first', 'nulls_first', 'nullsfirst'):
+            return True
+        if value in ('last', 'nulls_last', 'nullslast'):
+            return False
+    raise ValueError('invalid %s: %r' % (name, value))
+
+
+def _parse_ascending(value, name='ascending'):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, text_type):
+        value = value.strip().lower().replace('-', '_')
+        if value in ('asc', 'ascending', 'ascend', 'a'):
+            return True
+        if value in ('desc', 'descending', 'descend', 'd'):
+            return False
+    raise ValueError('invalid %s: %r' % (name, value))
+
+
+def _parse_nulls_last(value, name='nulls_last'):
+    if isinstance(value, bool):
+        return not value
+    if value is None:
+        return None
+    return _parse_null_placement(value, name)
+
+
+def _parse_sort_option(value, parser, name):
+    if isinstance(value, (list, tuple)):
+        return [parser(v, name) for v in value]
+    return parser(value, name)
+
+
+def _looks_like_sort_descriptor(value):
+    if isinstance(value, dict):
+        return 'field' in value or 'key' in value
+    return isinstance(value, (list, tuple))
+
+
+def _looks_like_sort_descriptor_list(value):
+    if not isinstance(value, (list, tuple)):
+        return False
+    return all(_looks_like_sort_descriptor(item) for item in value)
+
+
+def _parse_sort_descriptor(value):
+    if isinstance(value, dict):
+        if 'field' in value:
+            field = value['field']
+        elif 'key' in value:
+            field = value['key']
+        else:
+            raise ValueError('sort rule is missing a field: %r' % (value,))
+
+        direction = None
+        if 'reverse' in value:
+            direction = _parse_sort_direction(value['reverse'])
+        elif 'direction' in value:
+            direction = _parse_sort_direction(value['direction'])
+        elif 'order' in value:
+            direction = _parse_sort_direction(value['order'])
+        elif 'ascending' in value:
+            ascending = value['ascending']
+            if ascending is not None:
+                if not isinstance(ascending, bool):
+                    raise ValueError(
+                        'invalid ascending value: %r' % (ascending,)
+                    )
+                direction = not ascending
+
+        nulls_first = None
+        if 'nulls_first' in value:
+            nulls_first = _parse_null_placement(value['nulls_first'])
+        elif 'nulls_last' in value:
+            nulls_first = _parse_nulls_last(value['nulls_last'])
+        elif 'nulls' in value:
+            nulls_first = _parse_null_placement(value['nulls'])
+        elif 'na_position' in value:
+            nulls_first = _parse_null_placement(value['na_position'])
+        return field, direction, nulls_first
+
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError('invalid sort rule: %r' % (value,))
+    if len(value) > 3:
+        raise ValueError('invalid sort rule: %r' % (value,))
+
+    field = value[0]
+    direction = None
+    nulls_first = None
+    if len(value) >= 2:
+        direction = _parse_sort_direction(value[1])
+    if len(value) == 3:
+        nulls_first = _parse_null_placement(value[2])
+    return field, direction, nulls_first
+
+
+def _parse_sort_descriptors(key):
+    if isinstance(key, dict):
+        return [_parse_sort_descriptor(key)]
+    if _looks_like_sort_descriptor_list(key):
+        return [_parse_sort_descriptor(item) for item in key]
+    return None
+
+
+class _SortValue(object):
+    """Wrap a value so it can be ordered independently of other fields."""
+
+    __slots__ = ('value', 'reverse')
+
+    def __init__(self, value, reverse):
+        self.value = Comparable(value)
+        self.reverse = reverse
+
+    def __lt__(self, other):
+        if self.reverse:
+            return self.value > other.value
+        return self.value < other.value
+
+    def __eq__(self, other):
+        return isinstance(other, _SortValue) and self.value == other.value
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __gt__(self, other):
+        return not (self < other or self == other)
+
+    def __ge__(self, other):
+        return not (self < other)
+
+
+def _make_sortkey(indices, reverse, nulls_first):
+    fields = tuple(zip(indices, reverse, nulls_first))
+
+    def getkey(row):
+        key = []
+        for index, descending, nulls_at_start in fields:
+            try:
+                value = row[index]
+            except (IndexError, KeyError):
+                value = None
+            if value is None:
+                nullrank = 0 if nulls_at_start else 1
+            else:
+                nullrank = 1 if nulls_at_start else 0
+            key.append((nullrank, _SortValue(value, descending)))
+        return tuple(key)
+
+    return getkey
+
+
+def _close_iterators(iterators):
+    for iterator in iterators:
+        close = getattr(iterator, 'close', None)
+        if close is not None:
+            close()
+
+
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+         cache=True, nulls_first=None, nulls_last=None, **kwargs):
     """
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
@@ -103,6 +290,53 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
         | 'A' |   9 |
         +-----+-----+
 
+    Multiple fields can be sorted in different directions in one pass. Use a
+    list of sort rules, or pass per-field ``reverse`` and ``nulls_first``
+    options. Null placement is independent of sort direction, and missing
+    cells in short rows are treated as null. Sorting remains stable. E.g.::
+
+        >>> table6 = [['customer', 'amount'],
+        ...           ['B', 20],
+        ...           ['A', None],
+        ...           ['A', 5],
+        ...           ['B', None],
+        ...           ['A', 7]]
+        >>> table7 = etl.sort(
+        ...     table6,
+        ...     key=[('customer', 'asc'), ('amount', 'desc', 'last')]
+        ... )
+        >>> table7
+        +----------+--------+
+        | customer | amount |
+        +==========+========+
+        | 'A'      |      7 |
+        +----------+--------+
+        | 'A'      |      5 |
+        +----------+--------+
+        | 'A'      | None   |
+        +----------+--------+
+        | 'B'      |     20 |
+        +----------+--------+
+        | 'B'      | None   |
+        +----------+--------+
+
+        The equivalent per-field option form is::
+
+            etl.sort(table6, key=['customer', 'amount'],
+                     reverse=[False, True],
+                     nulls_first=[True, False])
+
+        Each sort rule may be a ``(field, direction, nulls)`` tuple or a
+        dictionary with ``field``, ``direction`` (or ``reverse``) and
+        ``nulls_first`` (or ``nulls_last``) keys. Direction may be
+        ``'asc'``/``'desc'`` or a boolean, where ``True`` means descending.
+        Null placement may be ``'first'``/``'last'`` or a boolean, where
+        ``True`` means first. Field names and indices follow the same rules as
+        other PETL field selectors. When per-field rules are used and null
+        placement is omitted, nulls are placed last. Calls using the original
+        ``key`` and boolean ``reverse`` arguments retain their previous
+        behaviour.
+
     The `buffersize` argument should be an `int` or `None`.
 
     If the number of rows in the table is less than `buffersize`, the table
@@ -126,8 +360,64 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
 
     """
 
+    sortkeys = kwargs.pop('sortkeys', None)
+    if sortkeys is not None:
+        if key is not None:
+            raise ValueError('sortkeys and key cannot both be specified')
+        key = sortkeys
+
+    directions = kwargs.pop('directions', None)
+    order = kwargs.pop('order', None)
+    ascending = kwargs.pop('ascending', None)
+    direction_aliases = [v for v in (directions, order, ascending)
+                         if v is not None]
+    if len(direction_aliases) > 1:
+        raise ValueError(
+            'only one of directions, order and ascending may be specified'
+        )
+    if direction_aliases:
+        if reverse not in (False, None):
+            raise ValueError(
+                'reverse cannot be combined with directions, order or '
+                'ascending'
+            )
+        if ascending is not None:
+            reverse = _parse_sort_option(
+                ascending, _parse_ascending, 'ascending'
+            )
+            if isinstance(reverse, list):
+                reverse = [not value for value in reverse]
+            else:
+                reverse = not reverse
+        else:
+            reverse = _parse_sort_option(
+                direction_aliases[0], _parse_sort_direction, 'direction'
+            )
+
+    nulls = kwargs.pop('nulls', None)
+    na_position = kwargs.pop('na_position', None)
+    null_aliases = [v for v in (nulls, na_position) if v is not None]
+    if len(null_aliases) > 1:
+        raise ValueError('only one of nulls and na_position may be specified')
+    if nulls_first is not None and nulls_last is not None:
+        raise ValueError('nulls_first and nulls_last cannot both be specified')
+    if null_aliases:
+        if nulls_first is not None or nulls_last is not None:
+            raise ValueError(
+                'nulls or na_position cannot be combined with nulls_first '
+                'or nulls_last'
+            )
+        nulls_first = null_aliases[0]
+
+    if kwargs:
+        unexpected = sorted(kwargs)[0]
+        raise TypeError(
+            "sort() got an unexpected keyword argument %r" % unexpected
+        )
+
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
-                    tempdir=tempdir, cache=cache)
+                    tempdir=tempdir, cache=cache,
+                    nulls_first=nulls_first, nulls_last=nulls_last)
 
 
 Table.sort = sort
@@ -236,12 +526,96 @@ def _mergesorted(key=None, reverse=False, *iterables):
         return _heapqmergesorted(key, *iterables)
 
 
+class _SortIterator(object):
+    __slots__ = ('view', 'iterator', '_exhausted')
+
+    def __init__(self, view):
+        self.view = view
+        self.iterator = None
+        self._exhausted = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._exhausted:
+            raise StopIteration
+        if self.iterator is None:
+            self.iterator = self.view._iter()
+        try:
+            return next(self.iterator)
+        except StopIteration:
+            self.close()
+            raise
+
+    next = __next__
+
+    def close(self):
+        iterator = self.iterator
+        self.iterator = None
+        self.view = None
+        self._exhausted = True
+        if iterator is not None:
+            close = getattr(iterator, 'close', None)
+            if close is not None:
+                close()
+
+
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
-                 tempdir=None, cache=True):
+                 tempdir=None, cache=True, nulls_first=None,
+                 nulls_last=None):
         self.source = source
         self.key = key
         self.reverse = reverse
+        self._descriptors = _parse_sort_descriptors(key)
+        reverse_option = _parse_sort_option(
+            reverse, _parse_sort_direction, 'reverse'
+        )
+        if reverse_option is None:
+            reverse_option = False
+        self._reverse_option = reverse_option
+
+        if nulls_first is not None and nulls_last is not None:
+            raise ValueError(
+                'nulls_first and nulls_last cannot both be specified'
+            )
+        if nulls_first is not None:
+            self._nulls_first_option = _parse_sort_option(
+                nulls_first, _parse_null_placement, 'nulls_first'
+            )
+        elif nulls_last is not None:
+            self._nulls_first_option = _parse_sort_option(
+                nulls_last, _parse_nulls_last, 'nulls_last'
+            )
+        else:
+            self._nulls_first_option = None
+
+        self._enhanced = (
+            self._descriptors is not None
+            or not isinstance(reverse, (bool, type(None)))
+            or nulls_first is not None
+            or nulls_last is not None
+        )
+        if self._descriptors is not None:
+            self._field_count = len(self._descriptors)
+        elif key is None:
+            self._field_count = None
+        elif isinstance(key, (list, tuple)):
+            self._field_count = len(key)
+        else:
+            self._field_count = 1
+        if self._field_count == 0:
+            raise ValueError('no fields selected for sorting')
+        self._validate_option_count(
+            self._reverse_option, 'reverse'
+        )
+        self._validate_option_count(
+            self._nulls_first_option, 'nulls_first'
+        )
+        self._mergereverse = (
+            reverse_option if isinstance(reverse_option, bool) else False
+        )
         if buffersize is None:
             self.buffersize = config.sort_buffersize
         else:
@@ -253,14 +627,32 @@ class SortView(Table):
         self._filecache = None
         self._getkey = None
 
+    def _validate_option_count(self, value, name):
+        if (
+            isinstance(value, list)
+            and self._field_count is not None
+            and len(value) != self._field_count
+        ):
+            raise ValueError(
+                '%s has %d values but %d sort fields were selected'
+                % (name, len(value), self._field_count)
+            )
+
     def clearcache(self):
         debug('clear cache')
+        filecache = self._filecache
+        self._filecache = None
+        if filecache:
+            for wrapper in filecache:
+                wrapper.delete()
         self._hdrcache = None
         self._memcache = None
-        self._filecache = None
         self._getkey = None
 
     def __iter__(self):
+        return _SortIterator(self)
+
+    def _iter(self):
         source = self.source
         key = self.key
         reverse = self.reverse
@@ -285,7 +677,7 @@ class SortView(Table):
         debug('iterate from file cache: %r', filenames)
         yield tuple(self._hdrcache)
         chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+        rows = _mergesorted(self._getkey, self._mergereverse, *chunkiters)
         try:
             for row in rows:
                 yield tuple(row)
@@ -294,10 +686,55 @@ class SortView(Table):
             # N.B., need to ensure that any open files are closed **before**
             # temporary files are deleted, as deletion will fail on Windows
             # if file is in use (i.e., still open)
-            del chunkiters
-            del rows
+            _close_iterators(chunkiters)
+            close = getattr(rows, 'close', None)
+            if close is not None:
+                close()
             del filecache
             debug('exiting generator')
+
+    def _spread_option(self, value, count, name):
+        if isinstance(value, list):
+            if len(value) != count:
+                raise ValueError(
+                    '%s has %d values but %d sort fields were selected'
+                    % (name, len(value), count)
+                )
+            return list(value)
+        return [value] * count
+
+    def _resolve_enhanced_getkey(self, hdr):
+        if self._descriptors is not None:
+            fields = [descriptor[0] for descriptor in self._descriptors]
+            indices = asindices(hdr, tuple(fields))
+        elif self.key is not None:
+            indices = asindices(hdr, self.key)
+        else:
+            indices = list(range(len(hdr)))
+
+        count = len(indices)
+        if count == 0:
+            raise ValueError('no fields selected for sorting')
+
+        reverse = self._spread_option(
+            self._reverse_option, count, 'reverse'
+        )
+        nulls_first = self._spread_option(
+            self._nulls_first_option, count, 'nulls_first'
+        )
+
+        if self._descriptors is not None:
+            for i, descriptor in enumerate(self._descriptors):
+                if descriptor[1] is not None:
+                    reverse[i] = descriptor[1]
+                if descriptor[2] is not None:
+                    nulls_first[i] = descriptor[2]
+
+        reverse = [False if value is None else value for value in reverse]
+        nulls_first = [
+            False if value is None else value for value in nulls_first
+        ]
+        return _make_sortkey(indices, reverse, nulls_first)
 
     def _iternocache(self, source, key, reverse):
         debug('iterate without cache')
@@ -312,13 +749,21 @@ class SortView(Table):
             hdr = []
         yield tuple(hdr)
 
-        if key is not None:
-            # convert field selection into field indices
-            indices = asindices(hdr, key)
+        if self._enhanced:
+            getkey = self._resolve_enhanced_getkey(hdr)
+            reverse = False
         else:
-            indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+            if key is not None:
+                # convert field selection into field indices
+                indices = asindices(hdr, key)
+            else:
+                indices = range(len(hdr))
+            if len(indices) == 0:
+                raise ValueError('no fields selected for sorting')
+            # now use field indices to construct a _getkey function
+            getkey = comparable_itemgetter(*indices)
+            reverse = self._reverse_option
+        self._mergereverse = reverse
 
         # TODO support native comparison
 
@@ -344,57 +789,79 @@ class SortView(Table):
             # no, table is too big, need to sort in chunks
 
             chunkfiles = []
+            cached = False
+            try:
+                while rows:
 
-            while rows:
+                    # dump the chunk
+                    with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                            mode='wb') as f:
+                        # N.B., we **don't** want the file to be deleted on
+                        # close, but we **do** want the file to be deleted when
+                        # self is garbage collected, or when the program exits.
+                        # When all references to the wrapper are gone, the file
+                        # should get deleted.
+                        wrapper = _NamedTempFileDeleteOnGC(f.name)
+                        debug('created temporary chunk file %s' % f.name)
+                        for row in rows:
+                            pickle.dump(row, f, protocol=-1)
+                        f.flush()
+                        chunkfiles.append(wrapper)
 
-                # dump the chunk
-                with NamedTemporaryFile(dir=self.tempdir, delete=False,
-                                        mode='wb') as f:
-                    # N.B., we **don't** want the file to be deleted on close,
-                    # but we **do** want the file to be deleted when self
-                    # is garbage collected, or when the program exits. When
-                    # all references to the wrapper are gone, the file should
-                    # get deleted.
-                    wrapper = _NamedTempFileDeleteOnGC(f.name)
-                    debug('created temporary chunk file %s' % f.name)
-                    for row in rows:
-                        pickle.dump(row, f, protocol=-1)
-                    f.flush()
-                    chunkfiles.append(wrapper)
+                    # grab the next chunk
+                    rows = list(itertools.islice(it, 0, self.buffersize))
+                    rows.sort(key=getkey, reverse=reverse)
 
-                # grab the next chunk
-                rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+                if self._cache:
+                    debug('caching files')
+                    self._hdrcache = hdr
+                    self._filecache = chunkfiles
+                    self._getkey = getkey
+                    cached = True
 
-            if self._cache:
-                debug('caching files')
-                self._hdrcache = hdr
-                self._filecache = chunkfiles
-                self._getkey = getkey
-
-            chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
-                yield tuple(row)
+                chunkiters = [_iterchunk(f.name) for f in chunkfiles]
+                merged = _mergesorted(getkey, reverse, *chunkiters)
+                try:
+                    for row in merged:
+                        yield tuple(row)
+                finally:
+                    _close_iterators(chunkiters)
+                    close = getattr(merged, 'close', None)
+                    if close is not None:
+                        close()
+            finally:
+                if not cached:
+                    for wrapper in chunkfiles:
+                        wrapper.delete()
 
 
 class _NamedTempFileDeleteOnGC(object):
 
     def __init__(self, name):
         self.name = name
+        self._deleted = False
 
     def delete(self, unlink=os.unlink, log=logger.debug):
+        if self._deleted:
+            return
         name = self.name
         try:
             log('deleting %s' % name)
             unlink(name)
         except Exception as e:
-            log('exception deleting %s: %s' % (name, e))
-            raise
+            if getattr(e, 'errno', None) == errno.ENOENT:
+                self._deleted = True
+            else:
+                log('exception deleting %s: %s' % (name, e))
         else:
+            self._deleted = True
             log('deleted %s' % name)
 
     def __del__(self):
-        self.delete()
+        try:
+            self.delete()
+        except Exception:
+            pass
 
     def __str__(self):
         return self.name

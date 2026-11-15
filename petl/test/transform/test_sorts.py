@@ -13,7 +13,7 @@ from petl.compat import next
 
 from petl.errors import FieldSelectionError
 from petl.test.helpers import ieq, eq_
-from petl.util import nrows
+from petl.util import nrows, wrap
 from petl.transform.basics import cat
 from petl.transform.sorts import sort, mergesort, issorted
 
@@ -609,3 +609,309 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+def test_sort_multiple_fields_mixed_directions_and_null_positions():
+    table = (
+        ('customer', 'amount', 'row'),
+        ('B', 20, 'b20'),
+        ('A', None, 'a-none'),
+        ('A', 5, 'a5-first'),
+        ('B', None, 'b-none'),
+        ('A', 7, 'a7'),
+        ('A', 5, 'a5-second'),
+    )
+    expectation = (
+        ('customer', 'amount', 'row'),
+        ('A', 7, 'a7'),
+        ('A', 5, 'a5-first'),
+        ('A', 5, 'a5-second'),
+        ('A', None, 'a-none'),
+        ('B', 20, 'b20'),
+        ('B', None, 'b-none'),
+    )
+
+    result = sort(
+        table,
+        key=[('customer', 'asc'), ('amount', 'desc', 'last')],
+        buffersize=2,
+    )
+    ieq(expectation, result)
+
+    result = sort(
+        table,
+        key=['customer', 'amount'],
+        reverse=[False, True],
+        nulls_first=[True, False],
+        buffersize=2,
+    )
+    ieq(expectation, result)
+
+    result = sort(
+        table,
+        key=['customer', 'amount'],
+        directions=['asc', 'desc'],
+        nulls=['first', 'last'],
+        buffersize=2,
+    )
+    ieq(expectation, result)
+
+    result = sort(
+        table,
+        key=['customer', 'amount'],
+        reverse=[False, True],
+        nulls_last=['first', 'last'],
+        buffersize=2,
+    )
+    ieq(expectation, result)
+
+    result = wrap(table).sort(
+        key=[('customer', 'asc'), ('amount', 'desc', 'last')],
+        buffersize=2,
+    )
+    ieq(expectation, result)
+
+
+@pytest.mark.parametrize('descending', [False, True])
+def test_sort_nulls_fixed_by_placement_not_direction(descending):
+    table = (
+        ('value',),
+        (2,),
+        (None,),
+        (1,),
+        (None,),
+        (3,),
+    )
+    direction = 'desc' if descending else 'asc'
+
+    first = sort(table, key=[('value', direction, 'first')], buffersize=1)
+    if descending:
+        ieq((('value',), (None,), (None,), (3,), (2,), (1,)), first)
+    else:
+        ieq((('value',), (None,), (None,), (1,), (2,), (3,)), first)
+
+    last = sort(table, key=[('value', direction, 'last')], buffersize=1)
+    if descending:
+        ieq((('value',), (3,), (2,), (1,), (None,), (None,)), last)
+    else:
+        ieq((('value',), (1,), (2,), (3,), (None,), (None,)), last)
+
+
+def test_sort_short_rows_use_missing_sort_cell_as_null():
+    table = (
+        ('foo', 'bar'),
+        ('x',),
+        ('y', 1),
+        ('x', 2),
+        ('y',),
+        ('x',),
+    )
+    expectation = (
+        ('foo', 'bar'),
+        ('x',),
+        ('y',),
+        ('x',),
+        ('y', 1),
+        ('x', 2),
+    )
+    result = sort(table, key=[('bar', 'asc', 'first')], buffersize=2)
+    ieq(expectation, result)
+
+
+def test_sort_multiple_fields_stable_for_equal_keys_across_chunks():
+    table = [('key1', 'key2', 'sequence')]
+    table.extend(
+        ('a', 1, sequence) for sequence in range(20)
+    )
+    table.extend(
+        ('a', 2, sequence) for sequence in range(20, 40)
+    )
+
+    result = sort(
+        table,
+        key=[('key1', 'asc'), ('key2', 'asc')],
+        buffersize=3,
+    )
+    rows = list(result)[1:]
+    assert [row[2] for row in rows] == list(range(20)) + list(range(20, 40))
+
+
+def test_sort_multiple_fields_errors():
+    table = (('foo', 'bar'), ('a', 1), ('b', 2))
+
+    with pytest.raises(FieldSelectionError):
+        list(sort(table, key=[('missing', 'asc')]))
+
+    with pytest.raises(ValueError):
+        sort(table, key=[('foo', 'sideways')])
+
+    with pytest.raises(ValueError):
+        sort(table, key=[('foo', 'asc', 'middle')])
+
+    with pytest.raises(ValueError):
+        sort(table, key=['foo', 'bar'], reverse=[False])
+
+    with pytest.raises(ValueError):
+        sort(table, key=['foo', 'bar'], nulls_first=[True])
+
+    with pytest.raises(ValueError):
+        sort(table, key='foo', nulls_first=True, nulls_last=True)
+
+    with pytest.raises(TypeError):
+        sort(table, key='foo', unknown_option=True)
+
+
+def _large_sort_table(nrows=2000):
+    table = [('customer', 'amount', 'sequence')]
+    for sequence in range(nrows):
+        customer = 'C%02d' % (sequence % 17)
+        if sequence % 13 == 0:
+            amount = None
+        else:
+            amount = sequence % 23
+        table.append((customer, amount, sequence))
+    return table
+
+
+def test_sort_large_memory_and_disk_results_match(tmp_path):
+    table = _large_sort_table()
+    rules = [('customer', 'asc', 'first'), ('amount', 'desc', 'last')]
+
+    expected = list(sort(table, key=rules, buffersize=None))
+    result = sort(
+        table,
+        key=rules,
+        buffersize=31,
+        tempdir=str(tmp_path),
+    )
+    actual = list(result)
+
+    eq_(expected, actual)
+    assert result._filecache is not None
+    assert len(result._filecache) > 1
+
+    groups = {}
+    for customer, amount, sequence in actual[1:]:
+        groups.setdefault((customer, amount), []).append(sequence)
+    for sequences in groups.values():
+        assert sequences == sorted(sequences)
+
+    del result
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+class _CountingSource(object):
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return iter(self.rows)
+
+
+@pytest.mark.parametrize('buffersize', [None, 2])
+def test_sort_multiple_fields_cache_and_interleaved_iteration(
+        tmp_path, buffersize):
+    table = (
+        ('customer', 'amount', 'row'),
+        ('B', 20, 'b20'),
+        ('A', None, 'a-none'),
+        ('A', 5, 'a5'),
+        ('B', None, 'b-none'),
+        ('A', 7, 'a7'),
+    )
+    expectation = (
+        ('customer', 'amount', 'row'),
+        ('A', 7, 'a7'),
+        ('A', 5, 'a5'),
+        ('A', None, 'a-none'),
+        ('B', 20, 'b20'),
+        ('B', None, 'b-none'),
+    )
+    source = _CountingSource(table)
+    result = sort(
+        source,
+        key=[('customer', 'asc'), ('amount', 'desc', 'last')],
+        buffersize=buffersize,
+        tempdir=str(tmp_path),
+    )
+
+    eq_(list(expectation), list(result))
+    eq_(1, source.iterations)
+    eq_(list(expectation), list(result))
+    eq_(1, source.iterations)
+
+    it1 = iter(result)
+    it2 = iter(result)
+    eq_(expectation[0], next(it1))
+    eq_(expectation[1], next(it1))
+    eq_(expectation[0], next(it2))
+    eq_(expectation[1], next(it2))
+    eq_(expectation[2], next(it2))
+    eq_(expectation[2], next(it1))
+    del it1, it2
+
+    result.clearcache()
+    assert list(tmp_path.iterdir()) == []
+    eq_(list(expectation), list(result))
+    eq_(2, source.iterations)
+
+    del result
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def _open_files_under(path):
+    fd_dir = '/proc/self/fd'
+    if not os.path.isdir(fd_dir):
+        return []
+    root = os.path.abspath(str(path)) + os.sep
+    open_files = []
+    for fd in os.listdir(fd_dir):
+        try:
+            target = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if os.path.abspath(target).startswith(root):
+            open_files.append(target)
+    return open_files
+
+
+@pytest.mark.parametrize('cache', [True, False])
+@pytest.mark.parametrize('partial', [False, True])
+def test_sort_multiple_fields_releases_temp_files_and_handles(
+        tmp_path, cache, partial):
+    table = (
+        ('customer', 'amount', 'row'),
+        ('B', 20, 'b20'),
+        ('A', None, 'a-none'),
+        ('A', 5, 'a5'),
+        ('B', None, 'b-none'),
+        ('A', 7, 'a7'),
+    )
+    result = sort(
+        table,
+        key=[('customer', 'asc'), ('amount', 'desc', 'last')],
+        buffersize=2,
+        tempdir=str(tmp_path),
+        cache=cache,
+    )
+
+    iterator = iter(result)
+    next(iterator)
+    next(iterator)
+    if not partial:
+        list(iterator)
+    del iterator
+
+    assert _open_files_under(tmp_path) == []
+    if not cache:
+        assert list(tmp_path.iterdir()) == []
+
+    del result
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+    assert _open_files_under(tmp_path) == []
