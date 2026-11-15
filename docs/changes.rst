@@ -4,6 +4,13 @@ Changes
 Version 1.7.33
 --------------
 
+* Add ``nearestjoin()`` (and the ``asofjoin()``, ``timejoin()``,
+  ``closestjoin()`` and ``matchjoin()`` aliases) for matching records by one
+  or more device fields and a numerical time field. Supports backward,
+  forward and nearest matching, an inclusive maximum time difference, stable
+  tie-breaking, left-outer output, prefixes for same-named fields, and both
+  streaming presorted input and externally sorted unsorted input.
+
 * Accept a tuple or list of fields passed as a single argument to
   ``valuecounter()`` and ``valuecounts()``, counting the same compound key
   as unpacking it with ``*``, like ``values()`` already does. It used to

@@ -162,6 +162,13 @@ Joins
 .. autofunction:: petl.transform.joins.crossjoin
 .. autofunction:: petl.transform.joins.antijoin
 .. autofunction:: petl.transform.joins.unjoin
+.. autofunction:: petl.transform.joins.nearestjoin
+.. autofunction:: petl.transform.joins.asofjoin
+.. autofunction:: petl.transform.joins.timejoin
+.. autofunction:: petl.transform.joins.closestjoin
+.. autofunction:: petl.transform.joins.matchjoin
+.. autofunction:: petl.transform.joins.joinnearest
+.. autofunction:: petl.transform.joins.asof
 .. autofunction:: petl.transform.hashjoins.hashjoin
 .. autofunction:: petl.transform.hashjoins.hashleftjoin
 .. autofunction:: petl.transform.hashjoins.hashlookupjoin

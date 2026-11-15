@@ -1,9 +1,11 @@
 from __future__ import absolute_import, division, print_function
 
 import itertools
+import math
+from numbers import Number
 
 from petl.comparison import Comparable, comparable_itemgetter
-from petl.compat import next, text_type
+from petl.compat import next, string_types, text_type
 from petl.errors import ArgumentError
 from petl.transform.basics import cut, cutout, stack
 from petl.transform.dedup import distinct
@@ -839,6 +841,721 @@ def iterlookupjoin(left, right, lkey, rkey, missing=None, lprefix=None,
     for lkval, lrowgrp in lgit:
         for row in joinrows(lrowgrp, None):
             yield tuple(row)
+
+
+_MATCH_BACKWARD = 'backward'
+_MATCH_FORWARD = 'forward'
+_MATCH_NEAREST = 'nearest'
+
+_MATCH_DIRECTION_ALIASES = {
+    'backward': _MATCH_BACKWARD,
+    'back': _MATCH_BACKWARD,
+    'before': _MATCH_BACKWARD,
+    'preceding': _MATCH_BACKWARD,
+    'previous': _MATCH_BACKWARD,
+    'prior': _MATCH_BACKWARD,
+    'last': _MATCH_BACKWARD,
+    'not_later': _MATCH_BACKWARD,
+    'not_later_than': _MATCH_BACKWARD,
+    'le': _MATCH_BACKWARD,
+    'forward': _MATCH_FORWARD,
+    'ahead': _MATCH_FORWARD,
+    'after': _MATCH_FORWARD,
+    'following': _MATCH_FORWARD,
+    'next': _MATCH_FORWARD,
+    'first': _MATCH_FORWARD,
+    'not_earlier': _MATCH_FORWARD,
+    'not_earlier_than': _MATCH_FORWARD,
+    'ge': _MATCH_FORWARD,
+    'nearest': _MATCH_NEAREST,
+    'closest': _MATCH_NEAREST,
+    'near': _MATCH_NEAREST,
+    'either': _MATCH_NEAREST,
+    'both': _MATCH_NEAREST,
+}
+
+
+class _TimeMatchError(ArgumentError, ValueError, TypeError):
+    """Raised for invalid time matching arguments or time values.
+
+    Inherits from :class:`petl.errors.ArgumentError`, :class:`ValueError` and
+    :class:`TypeError` so callers can use either exception style.
+    """
+
+
+def _normalise_direction(direction):
+    if direction is None:
+        return _MATCH_NEAREST
+    if not isinstance(direction, string_types):
+        raise _TimeMatchError(
+            'direction must be one of backward, forward or nearest'
+        )
+    key = direction.strip().lower().replace('-', '_').replace(' ', '_')
+    try:
+        return _MATCH_DIRECTION_ALIASES[key]
+    except KeyError:
+        raise _TimeMatchError(
+            'direction must be one of backward, forward or nearest'
+        )
+
+
+def _is_nonfinite(value):
+    if isinstance(value, float):
+        return math.isnan(value) or math.isinf(value)
+    try:
+        if value.is_nan():
+            return True
+    except (AttributeError, TypeError):
+        pass
+    try:
+        if value.is_infinite():
+            return True
+    except (AttributeError, TypeError):
+        pass
+    return False
+
+
+def _validate_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, Number) \
+            or isinstance(value, complex):
+        raise _TimeMatchError('%s must be a number, got %r' % (name, value))
+    if _is_nonfinite(value):
+        raise _TimeMatchError('%s must be finite, got %r' % (name, value))
+    return value
+
+
+def _validate_maxdiff(maxdiff):
+    if maxdiff is None:
+        return None
+    _validate_number(maxdiff, 'maxdiff')
+    if maxdiff < 0:
+        raise _TimeMatchError('maxdiff must be greater than or equal to zero')
+    return maxdiff
+
+
+def _as_field_list(fields):
+    if fields is None:
+        return None
+    if isinstance(fields, (list, tuple)):
+        return list(fields)
+    return [fields]
+
+
+def _as_time_field(fields):
+    if isinstance(fields, (list, tuple)):
+        if len(fields) != 1:
+            raise _TimeMatchError('time field must identify exactly one field')
+        return fields[0]
+    return fields
+
+
+def _without_time_field(device_key, time_field):
+    if device_key is None:
+        return None
+    fields = _as_field_list(device_key)
+    return [f for f in fields if f != time_field]
+
+
+def _field_name(hdr, spec):
+    indices = asindices(hdr, spec)
+    if len(indices) != 1:
+        raise _TimeMatchError('time field must identify exactly one field')
+    return text_type(hdr[indices[0]])
+
+
+def _natural_device_key(left, right, ltime, rtime):
+    lhdr = header(left)
+    rhdr = header(right)
+    lflds = list(map(text_type, lhdr))
+    rflds = list(map(text_type, rhdr))
+    ltime_name = _field_name(lhdr, ltime)
+    rtime_name = _field_name(rhdr, rtime)
+    time_fields = {ltime_name, rtime_name}
+    key = [f for f in lflds if f in rflds and f not in time_fields]
+    if len(key) == 1:
+        return key[0], key[0]
+    return key, key
+
+
+def _device_getter(indices):
+    if not indices:
+        # An empty device key means all rows belong to the same device.
+        return lambda row: Comparable(())
+    return comparable_itemgetter(*indices)
+
+
+def _sort_key(device_key, time_field):
+    key = _as_field_list(device_key)
+    key.append(time_field)
+    return key
+
+
+def _getter_for_time(hdr, time_field, missing):
+    indices = asindices(hdr, time_field)
+    if len(indices) != 1:
+        raise _TimeMatchError('time field must identify exactly one field')
+    index = indices[0]
+
+    def gettime(row):
+        try:
+            value = row[index]
+        except IndexError:
+            value = missing
+        return _validate_number(value, 'time value')
+
+    return gettime
+
+
+def _validated_rows(rows, gettime):
+    for row in rows:
+        gettime(row)
+        yield row
+
+
+def _squared(table, missing):
+    """Iterate a table once, trimming or padding rows to its header."""
+
+    it = iter(table)
+    try:
+        hdr = tuple(next(it))
+    except StopIteration:
+        return
+    n = len(hdr)
+    yield hdr
+    while True:
+        try:
+            row = next(it)
+        except StopIteration:
+            return
+        outrow = tuple(row)
+        if len(outrow) > n:
+            outrow = outrow[:n]
+        elif len(outrow) < n:
+            outrow += (missing,) * (n - len(outrow))
+        yield outrow
+
+
+class _SquaredView(Table):
+
+    def __init__(self, table, missing=None):
+        self.table = table
+        self.missing = missing
+
+    def __iter__(self):
+        return _squared(self.table, self.missing)
+
+
+def _match_direction(ltime, prev_time, prev_row, next_time, next_row,
+                     direction, maxdiff):
+    """Return the matching right row, or None.
+
+    ``prev_time`` is the latest distinct right-hand time less than or equal to
+    ``ltime`` and ``prev_row`` is the first right row at that time.
+    ``next_time`` is the earliest distinct right-hand time greater than
+    ``ltime`` and ``next_row`` is the first right row at that time.
+
+    Ties in the nearest direction are resolved in favour of the preceding
+    (``prev_row``) record.
+    """
+
+    if prev_time is not None and prev_time == ltime:
+        return prev_row
+
+    if direction == _MATCH_BACKWARD:
+        if prev_time is None:
+            return None
+        diff = ltime - prev_time
+        if maxdiff is None or diff <= maxdiff:
+            return prev_row
+        return None
+
+    if direction == _MATCH_FORWARD:
+        if next_time is None:
+            return None
+        diff = next_time - ltime
+        if maxdiff is None or diff <= maxdiff:
+            return next_row
+        return None
+
+    # nearest
+    if prev_time is None and next_time is None:
+        return None
+    elif prev_time is None:
+        diff = next_time - ltime
+        if maxdiff is None or diff <= maxdiff:
+            return next_row
+        return None
+    elif next_time is None:
+        diff = ltime - prev_time
+        if maxdiff is None or diff <= maxdiff:
+            return prev_row
+        return None
+
+    prev_diff = ltime - prev_time
+    next_diff = next_time - ltime
+    if prev_diff <= next_diff:
+        if maxdiff is None or prev_diff <= maxdiff:
+            return prev_row
+    else:
+        if maxdiff is None or next_diff <= maxdiff:
+            return next_row
+    return None
+
+
+def _iter_matched_device(lgroup, rgroup, getltime, getrtime, direction,
+                         maxdiff, missing, nright):
+    prev_time = None
+    prev_row = None
+
+    rtime_groups = itertools.groupby(rgroup, key=getrtime)
+
+    def load_next_group():
+        try:
+            group_time, group = next(rtime_groups)
+            return group_time, next(group)
+        except StopIteration:
+            return None, None
+
+    next_time, next_row = load_next_group()
+
+    for lrow in lgroup:
+        ltime = getltime(lrow)
+
+        while next_time is not None and next_time <= ltime:
+            prev_time = next_time
+            prev_row = next_row
+            next_time, next_row = load_next_group()
+
+        rrow = _match_direction(
+            ltime, prev_time, prev_row, next_time, next_row,
+            direction, maxdiff
+        )
+        if rrow is None:
+            yield tuple(lrow) + (missing,) * nright
+        else:
+            yield tuple(lrow) + tuple(rrow)
+
+
+def nearestjoin(left, right, key=None, lkey=None, rkey=None, ltime=None,
+                rtime=None, time=None, direction='nearest', maxdiff=None,
+                missing=None, presorted=False, buffersize=None, tempdir=None,
+                cache=True, lprefix=None, rprefix=None, **kwargs):
+    """
+    Match each row from `left` with at most one row from `right` by device and
+    by numerical time. E.g.::
+
+        >>> import petl as etl
+        >>> samples = (('device', 'time', 'value'),
+        ...            ('a', 10, 1.2),
+        ...            ('a', 12, 1.3),
+        ...            ('b', 5, 2.1))
+        >>> calibrations = (('device', 'time', 'offset'),
+        ...                 ('a', 9, 0.1),
+        ...                 ('a', 13, 0.3),
+        ...                 ('b', 7, 0.2))
+        >>> table = etl.nearestjoin(samples, calibrations, key='device',
+        ...                         ltime='time', rtime='time',
+        ...                         direction='nearest',
+        ...                         lprefix='sample_', rprefix='cal_')
+        >>> table
+        +---------------+-------------+--------------+------------+----------+------------+
+        | sample_device | sample_time | sample_value | cal_device | cal_time | cal_offset |
+        +===============+=============+==============+============+==========+============+
+        | 'a'           |          10 |          1.2 | 'a'        |        9 |        0.1 |
+        +---------------+-------------+--------------+------------+----------+------------+
+        | 'a'           |          12 |          1.3 | 'a'        |       13 |        0.3 |
+        +---------------+-------------+--------------+------------+----------+------------+
+        | 'b'           |           5 |          2.1 | 'b'        |        7 |        0.2 |
+        +---------------+-------------+--------------+------------+----------+------------+
+        <BLANKLINE>
+
+    This is a left outer join: every row from `left` is emitted exactly once.
+    When no suitable row from `right` is found, the right-hand fields are
+    filled with `missing`. All fields from both input tables are preserved.
+    Use `lprefix` and/or `rprefix` to distinguish fields with the same name,
+    e.g., ``lprefix='sample_'`` and ``rprefix='cal_'``.
+
+    The device is identified by one or more fields. Use `key` when both tables
+    use the same device fields, or `lkey` and `rkey` when they differ. If no
+    device key is given, fields common to both headers (excluding the time
+    fields) are used. The time fields can be selected via `ltime` and `rtime`;
+    `time` can be used as a shorthand when both are called the same. The time
+    fields default to ``'time'``.
+
+    `direction` controls which right-hand row is selected:
+
+    * ``'backward'`` (also ``'preceding'``, ``'prior'``): the nearest row with
+      a time less than or equal to the sample time;
+    * ``'forward'`` (also ``'following'``, ``'next'``): the nearest row with a
+      time greater than or equal to the sample time;
+    * ``'nearest'`` (the default; also ``'closest'``): the row with the
+      smallest absolute time difference, considering both sides.
+
+    `maxdiff` is an optional inclusive upper bound on the absolute time
+    difference. A difference exactly equal to `maxdiff` is accepted. There is
+    no upper bound when `maxdiff` is None.
+
+    **Tie-breaking.** If several right-hand rows share the same time, the
+    first one in the (stable) sorted right-hand input is used. If a sample is
+    exactly midway between a preceding and a following right-hand row, the
+    preceding row is used. These rules make matching deterministic for the
+    same input.
+
+    If `presorted` is True, both inputs must already be sorted by device and
+    time. Matching is then performed in a single pass over each input, using
+    memory proportional to a few rows rather than the size of a device group
+    or the right-hand table. If `presorted` is False, both inputs are sorted
+    first using :func:`petl.transform.sorts.sort`, which can spill to disk via
+    `buffersize`, `tempdir` and `cache`, so unsorted inputs larger than memory
+    are also supported. Sorted and unsorted inputs produce the same match
+    results; the output is ordered by the sorted left-hand input.
+
+    Existing joins and sorts are unaffected. This function is also available
+    as a table method, e.g., ``samples.nearestjoin(calibrations, ...)``.
+
+    .. versionadded:: 1.7.33
+    """
+
+    # Accept a few naturally spelled aliases without cluttering the main
+    # signature. Unknown keyword arguments are reported as usual.
+    if 'timefield' in kwargs:
+        time = kwargs.pop('timefield')
+    if 'time_field' in kwargs:
+        time = kwargs.pop('time_field')
+    if 'ltimefield' in kwargs:
+        ltime = kwargs.pop('ltimefield')
+    if 'rtimefield' in kwargs:
+        rtime = kwargs.pop('rtimefield')
+    if 'left_time' in kwargs:
+        ltime = kwargs.pop('left_time')
+    if 'right_time' in kwargs:
+        rtime = kwargs.pop('right_time')
+    if 'l_time' in kwargs:
+        ltime = kwargs.pop('l_time')
+    if 'r_time' in kwargs:
+        rtime = kwargs.pop('r_time')
+    if 'ltimestamp' in kwargs:
+        ltime = kwargs.pop('ltimestamp')
+    if 'rtimestamp' in kwargs:
+        rtime = kwargs.pop('rtimestamp')
+    if 'how' in kwargs:
+        direction = kwargs.pop('how')
+    if 'mode' in kwargs:
+        direction = kwargs.pop('mode')
+    if 'method' in kwargs:
+        direction = kwargs.pop('method')
+    if 'match' in kwargs:
+        direction = kwargs.pop('match')
+    if 'tolerance' in kwargs:
+        maxdiff = kwargs.pop('tolerance')
+    if 'max_diff' in kwargs:
+        maxdiff = kwargs.pop('max_diff')
+    if 'max_time_diff' in kwargs:
+        maxdiff = kwargs.pop('max_time_diff')
+    if 'max_difference' in kwargs:
+        maxdiff = kwargs.pop('max_difference')
+    if 'max_time_difference' in kwargs:
+        maxdiff = kwargs.pop('max_time_difference')
+    if 'max_delta' in kwargs:
+        maxdiff = kwargs.pop('max_delta')
+    if 'max_time_delta' in kwargs:
+        maxdiff = kwargs.pop('max_time_delta')
+    if 'max_time_gap' in kwargs:
+        maxdiff = kwargs.pop('max_time_gap')
+    if 'max_gap' in kwargs:
+        maxdiff = kwargs.pop('max_gap')
+    if 'time_tolerance' in kwargs:
+        maxdiff = kwargs.pop('time_tolerance')
+    if 'on' in kwargs and key is None:
+        key = kwargs.pop('on')
+    if 'device' in kwargs and key is None:
+        key = kwargs.pop('device')
+    if 'device_key' in kwargs and key is None:
+        key = kwargs.pop('device_key')
+    if 'keys' in kwargs and key is None:
+        key = kwargs.pop('keys')
+    if 'left_key' in kwargs and lkey is None:
+        lkey = kwargs.pop('left_key')
+    if 'right_key' in kwargs and rkey is None:
+        rkey = kwargs.pop('right_key')
+    if 'left_prefix' in kwargs and lprefix is None:
+        lprefix = kwargs.pop('left_prefix')
+    if 'right_prefix' in kwargs and rprefix is None:
+        rprefix = kwargs.pop('right_prefix')
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            "nearestjoin() got an unexpected keyword argument '%s'"
+            % unexpected
+        )
+
+    if time is not None:
+        if ltime is None:
+            ltime = time
+        if rtime is None:
+            rtime = time
+    if ltime is None:
+        ltime = 'time'
+    if rtime is None:
+        rtime = 'time'
+    ltime = _as_time_field(ltime)
+    rtime = _as_time_field(rtime)
+
+    if key is not None and lkey is None and rkey is None:
+        lkey = rkey = key
+    elif key is None and lkey is not None and rkey is not None:
+        pass
+    elif key is lkey is rkey is None:
+        # Resolved lazily from the headers, so that presorted inputs can be
+        # consumed in a single pass.
+        pass
+    else:
+        raise ArgumentError(
+            'bad key arguments: either specify key, or specify both lkey and '
+            'rkey, or provide no key/lkey/rkey arguments at all'
+        )
+
+    # Be forgiving if callers include the time field in the device key; the
+    # time is always handled separately by this function.
+    lkey = _without_time_field(lkey, ltime)
+    rkey = _without_time_field(rkey, rtime)
+
+    direction = _normalise_direction(direction)
+    maxdiff = _validate_maxdiff(maxdiff)
+
+    return NearestJoinView(
+        left, right, lkey=lkey, rkey=rkey, ltime=ltime, rtime=rtime,
+        direction=direction, maxdiff=maxdiff, missing=missing,
+        presorted=presorted, buffersize=buffersize, tempdir=tempdir,
+        cache=cache, lprefix=lprefix, rprefix=rprefix
+    )
+
+
+Table.nearestjoin = nearestjoin
+
+
+class NearestJoinView(Table):
+
+    def __init__(self, left, right, lkey, rkey, ltime, rtime, direction,
+                 maxdiff, missing=None, presorted=False, buffersize=None,
+                 tempdir=None, cache=True, lprefix=None, rprefix=None):
+        self.left = left
+        self.right = right
+        self.lkey = lkey
+        self.rkey = rkey
+        self.ltime = ltime
+        self.rtime = rtime
+        self.direction = direction
+        self.maxdiff = maxdiff
+        self.missing = missing
+        self.presorted = presorted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self._cache = cache
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+        if not presorted and lkey is not None and rkey is not None:
+            # Create the sort views once so their default cache can be reused
+            # across repeated iterations.
+            self._prepared_left = sort(
+                _SquaredView(left, missing), _sort_key(lkey, ltime),
+                buffersize=buffersize, tempdir=tempdir, cache=cache
+            )
+            self._prepared_right = sort(
+                _SquaredView(right, missing), _sort_key(rkey, rtime),
+                buffersize=buffersize, tempdir=tempdir, cache=cache
+            )
+        else:
+            self._prepared_left = None
+            self._prepared_right = None
+
+    def __len__(self):
+        # The result can be produced from a single-pass input, so its length
+        # is not known without consuming it. Let list()/tuple() fall back to
+        # iteration rather than probing the source an extra time.
+        raise TypeError('nearestjoin result has no known length')
+
+    def __length_hint__(self):
+        return 0
+
+    def __iter__(self):
+        lkey = self.lkey
+        rkey = self.rkey
+
+        if self._prepared_left is not None:
+            left = self._prepared_left
+            right = self._prepared_right
+        else:
+            left = _SquaredView(self.left, self.missing)
+            right = _SquaredView(self.right, self.missing)
+
+            if lkey is None or rkey is None:
+                if self.presorted:
+                    # Let the iterator resolve the natural key from the
+                    # headers while it already has the single-pass iterators
+                    # open.
+                    pass
+                else:
+                    lkey, rkey = _natural_device_key(
+                        left, right, self.ltime, self.rtime
+                    )
+
+            if not self.presorted:
+                left = sort(
+                    left, _sort_key(lkey, self.ltime),
+                    buffersize=self.buffersize, tempdir=self.tempdir,
+                    cache=self._cache
+                )
+                right = sort(
+                    right, _sort_key(rkey, self.rtime),
+                    buffersize=self.buffersize, tempdir=self.tempdir,
+                    cache=self._cache
+                )
+
+        return iternearestjoin(
+            left, right, lkey=lkey, rkey=rkey, ltime=self.ltime,
+            rtime=self.rtime, direction=self.direction, maxdiff=self.maxdiff,
+            missing=self.missing, lprefix=self.lprefix, rprefix=self.rprefix
+        )
+
+
+def iternearestjoin(left, right, lkey, rkey, ltime, rtime, direction,
+                    maxdiff, missing=None, lprefix=None, rprefix=None):
+    lit = iter(left)
+    rit = iter(right)
+
+    try:
+        lhdr = next(lit)
+    except StopIteration:
+        return
+    try:
+        rhdr = next(rit)
+    except StopIteration:
+        rhdr = ()
+
+    lflds = list(map(text_type, lhdr))
+    rflds = list(map(text_type, rhdr))
+
+    if not lflds:
+        # No sample fields and therefore no sample rows to emit.
+        yield tuple()
+        return
+
+    if not rflds:
+        # The right-hand table has no fields, so every sample is unmatched and
+        # there are no calibration fields to append.
+        if lprefix is None:
+            outhdr = list(lflds)
+        else:
+            outhdr = [text_type(lprefix) + f for f in lflds]
+        yield tuple(outhdr)
+        lgettime = _getter_for_time(lhdr, ltime, missing)
+        for lrow in lit:
+            lgettime(lrow)
+            yield tuple(lrow)
+        return
+
+    if lkey is None or rkey is None:
+        lkey, rkey = _natural_device_key(
+            (lhdr,), (rhdr,), ltime, rtime
+        )
+
+    lkind = asindices(lhdr, lkey)
+    rkind = asindices(rhdr, rkey)
+    lgettime = _getter_for_time(lhdr, ltime, missing)
+    rgettime = _getter_for_time(rhdr, rtime, missing)
+    lgetdev = _device_getter(lkind)
+    rgetdev = _device_getter(rkind)
+
+    if lprefix is None:
+        outhdr = list(lflds)
+    else:
+        outhdr = [text_type(lprefix) + f for f in lflds]
+    if rprefix is None:
+        outhdr.extend(rflds)
+    else:
+        outhdr.extend([text_type(rprefix) + f for f in rflds])
+    yield tuple(outhdr)
+
+    lit = _validated_rows(lit, lgettime)
+    rit = _validated_rows(rit, rgettime)
+    lgroups = itertools.groupby(lit, key=lgetdev)
+    rgroups = itertools.groupby(rit, key=rgetdev)
+
+    try:
+        rdev, rgroup = next(rgroups)
+    except StopIteration:
+        rdev, rgroup = None, None
+
+    for ldev, lgroup in lgroups:
+        while rgroup is not None and rdev < ldev:
+            try:
+                rdev, rgroup = next(rgroups)
+            except StopIteration:
+                rdev, rgroup = None, None
+
+        if rgroup is not None and rdev == ldev:
+            for outrow in _iter_matched_device(
+                    lgroup, rgroup, lgettime, rgettime, direction, maxdiff,
+                    missing, len(rflds)):
+                yield outrow
+            try:
+                rdev, rgroup = next(rgroups)
+            except StopIteration:
+                rdev, rgroup = None, None
+        else:
+            for lrow in lgroup:
+                # validate the sample time even when there cannot be a match
+                lgettime(lrow)
+                yield tuple(lrow) + (missing,) * len(rflds)
+
+
+# Common aliases. ``asofjoin`` follows the traditional as-of convention and
+# defaults to looking backwards, while the others share nearestjoin's default.
+def asofjoin(left, right, key=None, lkey=None, rkey=None, ltime=None,
+             rtime=None, time=None, direction='backward', maxdiff=None,
+             missing=None, presorted=False, buffersize=None, tempdir=None,
+             cache=True, lprefix=None, rprefix=None, **kwargs):
+    """As-of join: like :func:`nearestjoin`, defaulting to ``direction='backward'``."""
+    return nearestjoin(
+        left, right, key=key, lkey=lkey, rkey=rkey, ltime=ltime, rtime=rtime,
+        time=time, direction=direction, maxdiff=maxdiff, missing=missing,
+        presorted=presorted, buffersize=buffersize, tempdir=tempdir,
+        cache=cache, lprefix=lprefix, rprefix=rprefix, **kwargs
+    )
+
+
+def timejoin(left, right, *args, **kwargs):
+    """Alias for :func:`nearestjoin`."""
+    return nearestjoin(left, right, *args, **kwargs)
+
+
+def closestjoin(left, right, *args, **kwargs):
+    """Alias for :func:`nearestjoin`."""
+    return nearestjoin(left, right, *args, **kwargs)
+
+
+def matchjoin(left, right, *args, **kwargs):
+    """Alias for :func:`nearestjoin`."""
+    return nearestjoin(left, right, *args, **kwargs)
+
+
+def joinnearest(left, right, *args, **kwargs):
+    """Alias for :func:`nearestjoin`."""
+    return nearestjoin(left, right, *args, **kwargs)
+
+
+def asof(left, right, *args, **kwargs):
+    """Alias for :func:`asofjoin`."""
+    return asofjoin(left, right, *args, **kwargs)
+
+
+Table.asofjoin = asofjoin
+Table.timejoin = timejoin
+Table.closestjoin = closestjoin
+Table.matchjoin = matchjoin
+Table.joinnearest = joinnearest
+Table.asof = asof
 
 
 def unjoin(table, value, key=None, autoincrement=(1, 1), presorted=False,

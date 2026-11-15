@@ -21,7 +21,8 @@ from petl.transform.selects import select, selectop, selectcontains, \
     selectusingcontext, rowlenselect, facet, biselect
 
 from petl.transform.joins import join, leftjoin, rightjoin, outerjoin, \
-    crossjoin, antijoin, lookupjoin, unjoin
+    crossjoin, antijoin, lookupjoin, unjoin, nearestjoin, asofjoin, \
+    timejoin, closestjoin, matchjoin, joinnearest, asof
 
 from petl.transform.hashjoins import hashjoin, hashleftjoin, hashrightjoin, \
     hashantijoin, hashlookupjoin
