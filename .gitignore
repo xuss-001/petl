@@ -291,3 +291,13 @@ esbonio.*
 sketch*
 
 ## END of .gitignore file --------------------------------------------------------------
+
+# Local credentials and machine configuration
+.env.*
+*.pem
+*.key
+*token*.json
+credentials*
+secrets*
+.codex/
+.claude/
