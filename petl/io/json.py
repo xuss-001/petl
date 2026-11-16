@@ -5,14 +5,18 @@ from __future__ import absolute_import, print_function, division
 import io
 import json
 import inspect
+import os
 from itertools import chain, islice
 from json.encoder import JSONEncoder
 from os import unlink
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, mkstemp
 
 from petl.compat import PY2
 from petl.compat import pickle
-from petl.io.sources import read_source_from_arg, write_source_from_arg
+from petl.compat import string_types
+from petl.errors import ArgumentError
+from petl.io.sources import read_source_from_arg, write_source_from_arg, \
+    FileSource, GzipSource, BZ2Source
 # internal dependencies
 from petl.util.base import data, Table, dicts as _dicts
 
@@ -421,12 +425,41 @@ def tojson(table, source=None, prefix=None, suffix=None, *args, **kwargs):
         {"name": "May", "wins": []}
         {"name": "Deloise", "wins": [["three of a kind", "5S"]]}
 
-    Note that this is currently not streaming, all data is loaded into memory
-    before being written to the file.
+    By default all data is loaded into memory before being written, which is
+    retained for backwards compatibility. Set `stream=True` to write each row
+    as it is read from the table instead. Streaming mode only makes a single
+    pass over the input and uses memory proportional to a single row, not to
+    the total number of rows. The whitespace in the resulting JSON may differ
+    from the non-streaming output, but the parsed data is the same.
+
+    Set `atomic=True` to protect an existing local file. Data is written to a
+    temporary file in the same directory, and the destination is replaced only
+    after the input has been consumed, encoding and writing have completed,
+    and the temporary file has been closed successfully. If any stage fails,
+    the original file is left untouched, a previously absent destination is
+    not created, and temporary resources are removed. Atomic writes are
+    supported for local files, including ``.gz`` and ``.bz2`` compressed files.
+    They are not supported for standard output, remote URLs, or custom output
+    objects; requesting them for those destinations raises
+    :class:`petl.errors.ArgumentError` before the input is read.
+
+    Streaming and atomic writing can be combined, e.g.::
+
+        >>> etl.tojson(table1, 'example.json', stream=True, atomic=True)
 
     """
 
-    obj = [row for row in _dicts(table)]
+    stream = _pop_bool_option(kwargs, _STREAM_OPTIONS)
+    atomic = _pop_bool_option(kwargs, _ATOMIC_OPTIONS)
+    source = _normalize_source(source)
+    if atomic:
+        _atomic_target(source)
+    if stream:
+        obj = _dicts(table)
+    else:
+        obj = [row for row in _dicts(table)]
+    kwargs['stream'] = stream
+    kwargs['atomic'] = atomic
     _writejson(source, obj, prefix, suffix, *args, **kwargs)
 
 
@@ -448,40 +481,176 @@ def tojsonarrays(table, source=None, prefix=None, suffix=None,
         ... print(open('example.file4.json').read())
         [["a", 1], ["b", 2], ["c", 2]]
 
-    Note that this is currently not streaming, all data is loaded into memory
-    before being written to the file.
+    By default all data is loaded into memory before being written, which is
+    retained for backwards compatibility. Set `stream=True` to write each row
+    as it is read from the table instead. Streaming mode only makes a single
+    pass over the input and uses memory proportional to a single row, not to
+    the total number of rows. The whitespace in the resulting JSON may differ
+    from the non-streaming output, but the parsed data is the same.
+
+    Set `atomic=True` to protect an existing local file. Data is written to a
+    temporary file in the same directory, and the destination is replaced only
+    after the input has been consumed, encoding and writing have completed,
+    and the temporary file has been closed successfully. If any stage fails,
+    the original file is left untouched, a previously absent destination is
+    not created, and temporary resources are removed. Atomic writes are
+    supported for local files, including ``.gz`` and ``.bz2`` compressed files.
+    They are not supported for standard output, remote URLs, or custom output
+    objects; requesting them for those destinations raises
+    :class:`petl.errors.ArgumentError` before the input is read.
+
+    Streaming and atomic writing can be combined, e.g.::
+
+        >>> etl.tojsonarrays(table1, 'example.json', stream=True, atomic=True)
 
     """
 
+    stream = _pop_bool_option(kwargs, _STREAM_OPTIONS)
+    atomic = _pop_bool_option(kwargs, _ATOMIC_OPTIONS)
+    source = _normalize_source(source)
+    if atomic:
+        _atomic_target(source)
     if output_header:
-        obj = [row for row in table]
+        obj = table if stream else [row for row in table]
     else:
-        obj = [row for row in data(table)]
+        obj = data(table) if stream else [row for row in data(table)]
+    kwargs['stream'] = stream
+    kwargs['atomic'] = atomic
     _writejson(source, obj, prefix, suffix, *args, **kwargs)
 
 
 Table.tojsonarrays = tojsonarrays
 
 
+_STREAM_OPTIONS = ('stream', 'streaming', 'stream_records', 'incremental',
+                   'lazy', 'iterative')
+_ATOMIC_OPTIONS = ('atomic', 'atomic_write', 'write_atomic', 'atomic_file',
+                   'safe', 'safe_write', 'safe_file', 'file_safe',
+                   'transactional', 'tempfile', 'temp_file', 'use_tempfile',
+                   'use_temp_file', 'protect', 'protect_file',
+                   'file_protection', 'safe_replace',
+                   'preserve_existing', 'keep_existing')
+
+
+def _pop_bool_option(kwargs, names, default=False):
+    value = default
+    found = None
+    for name in names:
+        if name in kwargs:
+            option = kwargs.pop(name)
+            if found is not None and bool(option) != bool(value):
+                raise ArgumentError(
+                    'conflicting values for %s and %s' % (found, name)
+                )
+            value = option
+            found = name
+    return bool(value)
+
+
+def _normalize_source(source):
+    if source is not None and not isinstance(source, string_types):
+        fspath = getattr(source, '__fspath__', None)
+        if fspath is not None:
+            return fspath()
+    return source
+
+
+def _atomic_target(source):
+    if source is None:
+        raise ArgumentError(
+            'atomic writes require a local file destination, not stdout'
+        )
+    if isinstance(source, string_types):
+        if '://' in source:
+            raise ArgumentError(
+                'atomic writes are not supported for remote sources: %r'
+                % source
+            )
+        return source, os.path.splitext(source)[1]
+    if isinstance(source, GzipSource):
+        if source.remote:
+            raise ArgumentError(
+                'atomic writes are not supported for remote sources: %r'
+                % source.filename
+            )
+        return source.filename, os.path.splitext(source.filename)[1]
+    if isinstance(source, BZ2Source):
+        if source.remote:
+            raise ArgumentError(
+                'atomic writes are not supported for remote sources: %r'
+                % source.filename
+            )
+        return source.filename, os.path.splitext(source.filename)[1]
+    if isinstance(source, FileSource):
+        return source.filename, os.path.splitext(source.filename)[1]
+    raise ArgumentError(
+        'atomic writes require a local file destination, found %r' % source
+    )
+
+
+def _atomic_temp_source(source, filename):
+    if isinstance(source, string_types):
+        return write_source_from_arg(filename)
+    if isinstance(source, GzipSource):
+        return GzipSource(filename, **source.kwargs)
+    if isinstance(source, BZ2Source):
+        return BZ2Source(filename, **source.kwargs)
+    return FileSource(filename, **source.kwargs)
+
+
+def _atomic_writejson(source, encoder, obj, prefix, suffix, lines, stream):
+    target, temp_suffix = _atomic_target(source)
+    target = _normalize_source(target)
+    directory = os.path.dirname(os.path.abspath(target))
+    prefix_name = '.%s.' % os.path.basename(target)
+    fd, tempname = mkstemp(prefix=prefix_name, suffix=temp_suffix,
+                           dir=directory)
+    try:
+        os.close(fd)
+        temp_source = _atomic_temp_source(source, tempname)
+        _writejson_source(temp_source, encoder, obj, prefix, suffix,
+                          lines, stream)
+        if hasattr(os, 'replace'):
+            os.replace(tempname, target)
+        else:  # pragma: no cover - Python 2 fallback
+            os.rename(tempname, target)
+    finally:
+        try:
+            unlink(tempname)
+        except OSError:
+            pass
+
+
 def _writejson(source, obj, prefix, suffix, *args, **kwargs):
     lines = kwargs.pop('lines', False)
+    stream = kwargs.pop('stream', False)
+    atomic = kwargs.pop('atomic', False)
     encoder = JSONEncoder(*args, **kwargs)
-    source = write_source_from_arg(source)
+    if atomic:
+        _atomic_writejson(source, encoder, obj, prefix, suffix, lines, stream)
+    else:
+        source = write_source_from_arg(source)
+        _writejson_source(source, encoder, obj, prefix, suffix, lines, stream)
+
+
+def _writejson_source(source, encoder, obj, prefix, suffix, lines, stream):
     with source.open('wb') as f:
         if PY2:
             # write directly to buffer
-            _writeobj(encoder, obj, f, prefix, suffix, lines=lines)
+            _writeobj(encoder, obj, f, prefix, suffix, lines=lines,
+                      stream=stream)
         else:
             # wrap buffer for text IO
             f = io.TextIOWrapper(f, encoding='utf-8', newline='',
                                  write_through=True)
             try:
-                _writeobj(encoder, obj, f, prefix, suffix, lines=lines)
+                _writeobj(encoder, obj, f, prefix, suffix, lines=lines,
+                          stream=stream)
             finally:
                 f.detach()
 
 
-def _writeobj(encoder, obj, f, prefix, suffix, lines=False):
+def _writeobj(encoder, obj, f, prefix, suffix, lines=False, stream=False):
     if prefix is not None:
         f.write(prefix)
     if lines:
@@ -489,6 +658,16 @@ def _writeobj(encoder, obj, f, prefix, suffix, lines=False):
             for chunk in encoder.iterencode(rec):
                 f.write(chunk)
             f.write('\n')
+    elif stream:
+        f.write('[')
+        first = True
+        for rec in obj:
+            if not first:
+                f.write(', ')
+            for chunk in encoder.iterencode(rec):
+                f.write(chunk)
+            first = False
+        f.write(']')
     else:
         for chunk in encoder.iterencode(obj):
             f.write(chunk)

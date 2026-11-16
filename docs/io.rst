@@ -165,6 +165,21 @@ JSON files
 .. autofunction:: petl.io.json.tojson
 .. autofunction:: petl.io.json.tojsonarrays
 
+Both JSON writers accept ``stream=True`` to write rows as they are read from
+the table, so memory use does not grow with the number of rows. They also
+accept ``atomic=True`` to write through a temporary local file and replace the
+destination only after the input has been consumed, all records have been
+encoded and written, and the file has closed successfully. If any stage fails,
+the existing destination is preserved (or remains absent) and temporary files
+are removed. Atomic writes support ordinary files and the ``.gz`` and ``.bz2``
+compressed formats, and can be combined with streaming::
+
+    etl.tojson(table, 'output.json.gz', stream=True, atomic=True)
+
+Atomic writes are intentionally rejected for standard output, remote URLs and
+custom output objects; those destinations keep their normal non-atomic
+behaviour.
+
 .. module:: petl.io.streams
 .. _io_helpers:
 
